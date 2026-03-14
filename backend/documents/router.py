@@ -13,9 +13,12 @@ from schemas import (
 )
 from auth.utils import get_current_user
 from documents.storage import save_uploaded_file, get_file_type
-from ai_pipeline.pdf_processor import pdf_to_images, is_pdf
+from ai_pipeline.pdf_processor import pdf_to_images, is_pdf, extract_native_text
 from ai_pipeline.preprocessor import preprocess_image
-from ai_pipeline.ocr_engine import extract_text_from_image, extract_text_from_images
+from ai_pipeline.ocr_engine import (
+    extract_text_from_image, extract_text_from_images,
+    extract_tables_from_image, extract_tables_from_images,
+)
 from ai_pipeline.extractor import extract_structured_data
 from validation.engine import validate_extracted_data
 
@@ -68,10 +71,10 @@ async def upload_document(
 
     try:
         # 5. Process document through AI pipeline
-        raw_text = _run_ocr_pipeline(file_path, file_type)
+        raw_text, table_data = _run_ocr_pipeline(file_path, file_type)
 
-        # 6. Extract structured data
-        structured = extract_structured_data(raw_text)
+        # 6. Extract structured data (table data takes priority over regex)
+        structured = extract_structured_data(raw_text, table_data=table_data)
 
         # 7. Save extracted data
         extracted = _save_extracted_data(db, doc.id, raw_text, structured)
@@ -179,33 +182,54 @@ def get_audit_trail(
 
 # ─── Helper Functions ───
 
-def _run_ocr_pipeline(file_path: str, file_type: str) -> str:
-    """Run the full OCR pipeline on a document."""
+def _run_ocr_pipeline(file_path: str, file_type: str) -> tuple[str, list[dict]]:
+    """Run the full OCR pipeline on a document. Returns (raw_text, table_data)."""
+    table_data = []
     try:
         if file_type == "pdf":
             if is_pdf(file_path):
+                # First try native text extraction! Perfect accuracy for digital PDFs.
+                native_text = extract_native_text(file_path)
+                if native_text and len(native_text.strip()) > 100:
+                    return native_text, []
+
+                # Fallback to OCR if it's a scanned PDF
                 images = pdf_to_images(file_path)
                 if images:
                     processed = [preprocess_image(img) for img in images]
                     text = extract_text_from_images(processed)
+                    # Also extract tables from original (non-preprocessed) images
+                    # PPStructure works better on original images
+                    try:
+                        table_data = extract_tables_from_images(images)
+                    except Exception as e:
+                        print(f"Table extraction failed (non-critical): {e}")
                     if text and "[OCR Error" not in text:
-                        return text
-                    return text # Return the error message if OCR failed
+                        return text, table_data
+                    return text, table_data
 
             # Fallback: try to open as image
             try:
                 img = Image.open(file_path)
                 processed = preprocess_image(img)
-                return extract_text_from_image(processed)
+                try:
+                    table_data = extract_tables_from_image(img)
+                except Exception as e:
+                    print(f"Table extraction failed (non-critical): {e}")
+                return extract_text_from_image(processed), table_data
             except Exception as e:
-                return f"[Could not process PDF as image: {str(e)}]"
+                return f"[Could not process PDF as image: {str(e)}]", []
         else:
             # Image file
             img = Image.open(file_path)
             processed = preprocess_image(img)
-            return extract_text_from_image(processed)
+            try:
+                table_data = extract_tables_from_image(img)
+            except Exception as e:
+                print(f"Table extraction failed (non-critical): {e}")
+            return extract_text_from_image(processed), table_data
     except Exception as e:
-        return f"[OCR Pipeline Error: {str(e)}]"
+        return f"[OCR Pipeline Error: {str(e)}]", []
 
 
 def _save_extracted_data(db: Session, doc_id: int, raw_text: str, structured: dict) -> ExtractedData:

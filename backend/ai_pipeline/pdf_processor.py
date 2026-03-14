@@ -41,3 +41,19 @@ def pdf_to_images(pdf_path: str, dpi: int = 300) -> list[Image.Image]:
 def is_pdf(file_path: str) -> bool:
     """Check if a file is a PDF."""
     return Path(file_path).suffix.lower() == ".pdf"
+
+def extract_native_text(pdf_path: str) -> str:
+    """
+    Extracts embedded text directly from a PDF.
+    Returns the string text or empty string if it's a scanned/flattened image PDF.
+    """
+    try:
+        doc = fitz.open(pdf_path)
+        text = ""
+        for page in doc:
+            text += page.get_text() + "\n"
+        doc.close()
+        return text.strip()
+    except Exception as e:
+        print(f"PyMuPDF native text extraction failed: {e}")
+        return ""
